@@ -1,12 +1,34 @@
 import { createHmac, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
+import { refreshAccessToken } from "@/lib/oauth";
 
-// Reject events older than 5 minutes (non-blocking for first test: logs warning, doesn't 401)
 const MAX_AGE_SECONDS = 300;
 const ENFORCE_TIMESTAMP = false;
+const MILENA_UUID = "a866d63a-3221-4731-929a-5c544aa7115a";
+const API_BASE = "https://api.fanvue.com";
+const API_VERSION = "2025-06-26";
+const TEST_REPLY = "Test 123 — automatische Antwort";
+
+async function sendMessage(
+  accessToken: string,
+  fanUuid: string,
+): Promise<{ ok: boolean; status: number; body: string }> {
+  const url = `${API_BASE}/chats/${fanUuid}/message`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      "X-Fanvue-API-Version": API_VERSION,
+    },
+    body: JSON.stringify({ text: TEST_REPLY }),
+  });
+  const body = await res.text();
+  return { ok: res.ok, status: res.status, body };
+}
 
 export async function POST(request: Request) {
-  // Read raw body BEFORE any parsing — required for correct HMAC verification
+  // Raw body lesen — muss vor jeder anderen Verarbeitung passieren
   const rawBody = await request.text();
 
   const signingSecret = process.env.FANVUE_SIGNING_SECRET;
@@ -51,7 +73,6 @@ export async function POST(request: Request) {
   try {
     valid = timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(receivedSig, "utf8"));
   } catch {
-    // Lengths differ -> definitely invalid
     valid = false;
   }
 
@@ -60,14 +81,51 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "invalid signature" }, { status: 401 });
   }
 
-  // Valid event — parse and log for Vercel log inspection
-  let event: unknown = rawBody;
+  // Event parsen und loggen
+  let event: Record<string, unknown> = {};
   try {
     event = JSON.parse(rawBody);
   } catch {
-    // non-JSON body, logged as-is
+    console.log("[webhook/fanvue] event received (non-JSON):", rawBody);
+    return NextResponse.json({ received: true }, { status: 200 });
   }
   console.log("[webhook/fanvue] event received:", JSON.stringify(event));
 
+  // Auto-Antwort: nur auf Fan-Nachrichten, die an Milena adressiert sind
+  const senderUuid = (event.sender as { uuid?: string } | undefined)?.uuid;
+  const recipientUuid = event.recipientUuid as string | undefined;
+
+  if (
+    recipientUuid === MILENA_UUID &&
+    senderUuid &&
+    senderUuid !== MILENA_UUID
+  ) {
+    const refreshToken = process.env.FANVUE_REFRESH_TOKEN;
+    if (!refreshToken) {
+      console.error("[webhook/fanvue] FANVUE_REFRESH_TOKEN not set — skipping auto-reply");
+    } else {
+      let accessToken: string | null = null;
+      try {
+        const refreshed = await refreshAccessToken(refreshToken);
+        accessToken = refreshed.access_token;
+        console.log("[webhook/fanvue] Token geholt: ja");
+      } catch (e) {
+        console.error("[webhook/fanvue] Token geholt: nein —", String(e));
+      }
+
+      if (accessToken) {
+        try {
+          const result = await sendMessage(accessToken, senderUuid);
+          console.log(
+            `[webhook/fanvue] Sende-Versuch an ${senderUuid}: Status=${result.status} Body=${result.body}`,
+          );
+        } catch (e) {
+          console.error("[webhook/fanvue] Sende-Fehler:", String(e));
+        }
+      }
+    }
+  }
+
+  // Immer 200 zurück — Fanvue soll bei Sendefehlern nicht retryen
   return NextResponse.json({ received: true }, { status: 200 });
 }
