@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { refreshAccessToken } from "@/lib/oauth";
+import { getRefreshToken, setRefreshToken } from "@/lib/tokenStore";
 
 const MAX_AGE_SECONDS = 300;
 const ENFORCE_TIMESTAMP = false;
@@ -100,19 +101,35 @@ export async function POST(request: Request) {
     senderUuid &&
     senderUuid !== MILENA_UUID
   ) {
-    const refreshToken = process.env.FANVUE_REFRESH_TOKEN;
+    // 1. Refresh-Token aus Redis holen (mit Env-Fallback)
+    const refreshToken = await getRefreshToken();
+    console.log(`[webhook/fanvue] refresh_token aus Redis gelesen: ${refreshToken ? "ja" : "nein"}`);
+
     if (!refreshToken) {
-      console.error("[webhook/fanvue] FANVUE_REFRESH_TOKEN not set — skipping auto-reply");
+      console.error("[webhook/fanvue] kein refresh_token verfügbar — skipping auto-reply");
     } else {
       let accessToken: string | null = null;
+
       try {
+        // 2. Neues Access-Token + rotiertes Refresh-Token holen
         const refreshed = await refreshAccessToken(refreshToken);
         accessToken = refreshed.access_token;
         console.log("[webhook/fanvue] Token geholt: ja");
+
+        // 3. Rotiertes Refresh-Token SOFORT in Redis schreiben — BEVOR gesendet wird.
+        //    Reihenfolge ist kritisch: bei Absturz nach dem Refresh aber vor dem Speichern
+        //    wäre das Token verbrannt.
+        if (refreshed.refresh_token) {
+          await setRefreshToken(refreshed.refresh_token);
+          console.log("[webhook/fanvue] neues refresh_token gespeichert: ja");
+        } else {
+          console.warn("[webhook/fanvue] neues refresh_token gespeichert: nein (Antwort enthielt keins)");
+        }
       } catch (e) {
         console.error("[webhook/fanvue] Token geholt: nein —", String(e));
       }
 
+      // 4. Nachricht senden
       if (accessToken) {
         try {
           const result = await sendMessage(accessToken, senderUuid);
