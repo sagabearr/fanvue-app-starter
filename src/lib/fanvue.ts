@@ -1,6 +1,7 @@
 import { env } from "@/env";
 import { getSession, setSession } from "@/lib/session";
 import { refreshAccessToken } from "@/lib/oauth";
+import { setRefreshToken } from "@/lib/tokenStore";
 
 export async function getCurrentUser() {
   let session = await getSession();
@@ -17,6 +18,9 @@ export async function getCurrentUser() {
         expiresAt: Date.now() + refreshed.expires_in * 1000,
       };
       await setSession(updatedSession);
+      if (refreshed.refresh_token) {
+        await setRefreshToken(refreshed.refresh_token);
+      }
       session = updatedSession;
     } catch {}
   }
