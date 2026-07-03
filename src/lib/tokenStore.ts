@@ -12,7 +12,7 @@ let connectPromise: Promise<void> | null = null;
 async function connect(): Promise<void> {
   if (client.isReady) return;
   if (!connectPromise) {
-    connectPromise = client.connect().finally(() => { connectPromise = null; });
+    connectPromise = client.connect().then(() => undefined).finally(() => { connectPromise = null; });
   }
   await connectPromise;
 }
