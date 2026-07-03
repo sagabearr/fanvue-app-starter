@@ -2,17 +2,18 @@ import { createHmac, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { refreshAccessToken } from "@/lib/oauth";
 import { getAccessToken, getRefreshToken, setTokens } from "@/lib/tokenStore";
+import { generateResponse } from "@/lib/milena";
 
 const MAX_AGE_SECONDS = 300;
 const ENFORCE_TIMESTAMP = false;
 const MILENA_UUID = "a866d63a-3221-4731-929a-5c544aa7115a";
 const API_BASE = "https://api.fanvue.com";
 const API_VERSION = "2025-06-26";
-const TEST_REPLY = "Test 123 — automatische Antwort";
 
 async function sendMessage(
   accessToken: string,
   fanUuid: string,
+  text: string,
 ): Promise<{ ok: boolean; status: number; body: string }> {
   const url = `${API_BASE}/chats/${fanUuid}/message`;
   const res = await fetch(url, {
@@ -22,7 +23,7 @@ async function sendMessage(
       "Content-Type": "application/json",
       "X-Fanvue-API-Version": API_VERSION,
     },
-    body: JSON.stringify({ text: TEST_REPLY }),
+    body: JSON.stringify({ text }),
   });
   const body = await res.text();
   return { ok: res.ok, status: res.status, body };
@@ -47,7 +48,6 @@ async function resolveAccessToken(): Promise<string | null> {
 
   try {
     const refreshed = await refreshAccessToken(refreshToken);
-    // Neue Tokens SOFORT sichern, bevor irgendetwas anderes passiert
     await setTokens(refreshed.access_token, refreshed.expires_in, refreshed.refresh_token);
     console.log(`[webhook/fanvue] Token-Refresh: ok, neues RT gespeichert: ${refreshed.refresh_token ? "ja" : "nein"}`);
     return refreshed.access_token;
@@ -108,7 +108,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "invalid signature" }, { status: 401 });
   }
 
-  // Event parsen und loggen
+  // Parse event
   let event: Record<string, unknown> = {};
   try {
     event = JSON.parse(rawBody);
@@ -118,7 +118,6 @@ export async function POST(request: Request) {
   }
   console.log("[webhook/fanvue] event received:", JSON.stringify(event));
 
-  // Absender- und Empfänger-UUID aus dem Event lesen
   const senderUuid = (event.sender as { uuid?: string } | undefined)?.uuid;
   const recipientUuid = event.recipientUuid as string | undefined;
 
@@ -129,22 +128,42 @@ export async function POST(request: Request) {
     senderUuid &&
     senderUuid !== MILENA_UUID
   ) {
-    const accessToken = await resolveAccessToken();
+    // Extract incoming message text
+    const incomingText =
+      (event.message as { text?: string } | undefined)?.text ??
+      (event.text as string | undefined) ??
+      "";
 
-    if (accessToken) {
-      try {
-        const result = await sendMessage(accessToken, senderUuid);
-        console.log(
-          `[webhook/fanvue] Sende-Versuch an ${senderUuid}: Status=${result.status} Body=${result.body}`,
-        );
-      } catch (e) {
-        console.error("[webhook/fanvue] Sende-Fehler:", String(e));
+    if (!incomingText) {
+      console.log("[webhook/fanvue] kein Nachrichtentext im Event — überspringe");
+      return NextResponse.json({ received: true }, { status: 200 });
+    }
+
+    try {
+      const result = await generateResponse(senderUuid, incomingText);
+      console.log(`[webhook/fanvue] Route: ${result.route}`);
+
+      if (result.route === "block") {
+        console.log("[webhook/fanvue] BLOCK — keine Antwort gesendet");
+      } else if (result.reply) {
+        const accessToken = await resolveAccessToken();
+        if (accessToken) {
+          const sent = await sendMessage(accessToken, senderUuid, result.reply);
+          console.log(`[webhook/fanvue] gesendet: Status=${sent.status} ok=${sent.ok}`);
+          if (!sent.ok) {
+            console.error(`[webhook/fanvue] Sende-Fehler Body: ${sent.body}`);
+          }
+        } else {
+          console.error("[webhook/fanvue] kein Access-Token — Antwort nicht gesendet");
+        }
       }
+    } catch (e) {
+      console.error("[webhook/fanvue] generateResponse fehlgeschlagen:", String(e));
     }
   } else {
     console.log("[webhook/fanvue] Guard nicht erfüllt — kein Auto-Reply");
   }
 
-  // Immer 200 — kein Fanvue-Retry bei Sendefehlern
+  // Immer 200 — kein Fanvue-Retry
   return NextResponse.json({ received: true }, { status: 200 });
 }
