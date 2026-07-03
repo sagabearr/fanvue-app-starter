@@ -3,7 +3,7 @@ import { cookies } from "next/headers";
 import { env } from "@/env";
 import { exchangeCodeForToken } from "@/lib/oauth";
 import { setSession } from "@/lib/session";
-import { setRefreshToken } from "@/lib/tokenStore";
+import { setTokens } from "@/lib/tokenStore";
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
@@ -47,9 +47,7 @@ export async function GET(request: Request) {
       expiresAt: Date.now() + token.expires_in * 1000,
     });
 
-    if (token.refresh_token) {
-      await setRefreshToken(token.refresh_token);
-    }
+    await setTokens(token.access_token, token.expires_in, token.refresh_token);
 
     return NextResponse.redirect(new URL(`${env.BASE_URL}/`, request.url));
   } catch (e) {
@@ -98,9 +96,7 @@ export async function POST(request: Request) {
       expiresAt: Date.now() + token.expires_in * 1000,
     });
 
-    if (token.refresh_token) {
-      await setRefreshToken(token.refresh_token);
-    }
+    await setTokens(token.access_token, token.expires_in, token.refresh_token);
 
     return NextResponse.redirect(new URL(`${env.BASE_URL}/`, request.url));
   } catch (e) {

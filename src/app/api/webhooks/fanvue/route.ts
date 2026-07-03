@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { refreshAccessToken } from "@/lib/oauth";
-import { getRefreshToken, setRefreshToken } from "@/lib/tokenStore";
+import { getAccessToken, getRefreshToken, setTokens } from "@/lib/tokenStore";
 
 const MAX_AGE_SECONDS = 300;
 const ENFORCE_TIMESTAMP = false;
@@ -28,8 +28,36 @@ async function sendMessage(
   return { ok: res.ok, status: res.status, body };
 }
 
+/** Returns a valid access token from Redis, refreshing only if expired. */
+async function resolveAccessToken(): Promise<string | null> {
+  const stored = await getAccessToken();
+
+  if (stored && !stored.expired) {
+    console.log("[webhook/fanvue] access_token: aus Redis, noch gültig");
+    return stored.token;
+  }
+
+  console.log(`[webhook/fanvue] access_token: ${stored ? "abgelaufen" : "fehlt"} — Refresh nötig`);
+
+  const refreshToken = await getRefreshToken();
+  if (!refreshToken) {
+    console.error("[webhook/fanvue] kein refresh_token in Redis — Login erforderlich");
+    return null;
+  }
+
+  try {
+    const refreshed = await refreshAccessToken(refreshToken);
+    // Neue Tokens SOFORT sichern, bevor irgendetwas anderes passiert
+    await setTokens(refreshed.access_token, refreshed.expires_in, refreshed.refresh_token);
+    console.log(`[webhook/fanvue] Token-Refresh: ok, neues RT gespeichert: ${refreshed.refresh_token ? "ja" : "nein"}`);
+    return refreshed.access_token;
+  } catch (e) {
+    console.error("[webhook/fanvue] Token-Refresh fehlgeschlagen:", String(e));
+    return null;
+  }
+}
+
 export async function POST(request: Request) {
-  // Raw body lesen — muss vor jeder anderen Verarbeitung passieren
   const rawBody = await request.text();
 
   const signingSecret = process.env.FANVUE_SIGNING_SECRET;
@@ -54,7 +82,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "missing signature" }, { status: 401 });
   }
 
-  // Timestamp check (optional — warns only until ENFORCE_TIMESTAMP = true)
   const ts = parseInt(timestamp, 10);
   const nowSeconds = Math.floor(Date.now() / 1000);
   if (isNaN(ts) || Math.abs(nowSeconds - ts) > MAX_AGE_SECONDS) {
@@ -65,7 +92,6 @@ export async function POST(request: Request) {
     console.warn(`[webhook/fanvue] stale timestamp (not enforced): ${timestamp}`);
   }
 
-  // HMAC-SHA256 over "{timestamp}.{rawBody}"
   const expected = createHmac("sha256", signingSecret)
     .update(`${timestamp}.${rawBody}`)
     .digest("hex");
@@ -92,57 +118,33 @@ export async function POST(request: Request) {
   }
   console.log("[webhook/fanvue] event received:", JSON.stringify(event));
 
-  // Auto-Antwort: nur auf Fan-Nachrichten, die an Milena adressiert sind
+  // Absender- und Empfänger-UUID aus dem Event lesen
   const senderUuid = (event.sender as { uuid?: string } | undefined)?.uuid;
   const recipientUuid = event.recipientUuid as string | undefined;
+
+  console.log(`[webhook/fanvue] senderUuid=${senderUuid ?? "n/a"} recipientUuid=${recipientUuid ?? "n/a"}`);
 
   if (
     recipientUuid === MILENA_UUID &&
     senderUuid &&
     senderUuid !== MILENA_UUID
   ) {
-    // 1. Refresh-Token aus Redis holen (mit Env-Fallback)
-    const refreshToken = await getRefreshToken();
-    console.log(`[webhook/fanvue] refresh_token aus Redis gelesen: ${refreshToken ? "ja" : "nein"}`);
+    const accessToken = await resolveAccessToken();
 
-    if (!refreshToken) {
-      console.error("[webhook/fanvue] kein refresh_token verfügbar — skipping auto-reply");
-    } else {
-      let accessToken: string | null = null;
-
+    if (accessToken) {
       try {
-        // 2. Neues Access-Token + rotiertes Refresh-Token holen
-        const refreshed = await refreshAccessToken(refreshToken);
-        accessToken = refreshed.access_token;
-        console.log("[webhook/fanvue] Token geholt: ja");
-
-        // 3. Rotiertes Refresh-Token SOFORT in Redis schreiben — BEVOR gesendet wird.
-        //    Reihenfolge ist kritisch: bei Absturz nach dem Refresh aber vor dem Speichern
-        //    wäre das Token verbrannt.
-        if (refreshed.refresh_token) {
-          await setRefreshToken(refreshed.refresh_token);
-          console.log("[webhook/fanvue] neues refresh_token gespeichert: ja");
-        } else {
-          console.warn("[webhook/fanvue] neues refresh_token gespeichert: nein (Antwort enthielt keins)");
-        }
+        const result = await sendMessage(accessToken, senderUuid);
+        console.log(
+          `[webhook/fanvue] Sende-Versuch an ${senderUuid}: Status=${result.status} Body=${result.body}`,
+        );
       } catch (e) {
-        console.error("[webhook/fanvue] Token geholt: nein —", String(e));
-      }
-
-      // 4. Nachricht senden
-      if (accessToken) {
-        try {
-          const result = await sendMessage(accessToken, senderUuid);
-          console.log(
-            `[webhook/fanvue] Sende-Versuch an ${senderUuid}: Status=${result.status} Body=${result.body}`,
-          );
-        } catch (e) {
-          console.error("[webhook/fanvue] Sende-Fehler:", String(e));
-        }
+        console.error("[webhook/fanvue] Sende-Fehler:", String(e));
       }
     }
+  } else {
+    console.log("[webhook/fanvue] Guard nicht erfüllt — kein Auto-Reply");
   }
 
-  // Immer 200 zurück — Fanvue soll bei Sendefehlern nicht retryen
+  // Immer 200 — kein Fanvue-Retry bei Sendefehlern
   return NextResponse.json({ received: true }, { status: 200 });
 }
