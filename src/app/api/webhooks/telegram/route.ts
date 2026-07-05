@@ -60,16 +60,30 @@ export async function POST(request: Request) {
 
     const accessToken = await resolveAccessToken();
     if (!accessToken) {
-      await answerCallback(botToken, cq.id, "Kein Access-Token — Login erforderlich.");
+      await answerCallback(botToken, cq.id, "⚠️ Kein Access-Token — Login auf Fanvue erforderlich.");
       return NextResponse.json({ ok: true });
     }
 
+    // Sende jede Nachricht und prüfe das Ergebnis
+    let allOk = true;
     for (const text of draft.messages) {
-      await sendFanvueMessage(accessToken, draft.fanUuid, text);
+      const result = await sendFanvueMessage(accessToken, draft.fanUuid, text);
+      if (!result.ok) {
+        allOk = false;
+        console.error(`[telegram/send] Fanvue-Send fehlgeschlagen: ${result.status} | fan=${draft.fanUuid}`);
+      }
     }
-    await deleteDraft(draftId);
-    await answerCallback(botToken, cq.id, "✅ Gesendet");
-    if (chatId && messageId) await editMessage(botToken, chatId, messageId, "✅ Gesendet an Fan.");
+
+    if (allOk) {
+      await deleteDraft(draftId);
+      await answerCallback(botToken, cq.id, "✅ Gesendet");
+      if (chatId && messageId) await editMessage(botToken, chatId, messageId, "✅ Gesendet an Fan.");
+    } else {
+      // Draft NICHT löschen — Retry möglich
+      await answerCallback(botToken, cq.id, "⚠️ Senden fehlgeschlagen — Auth-Problem? Draft bleibt.");
+      if (chatId && messageId)
+        await editMessage(botToken, chatId, messageId, "⚠️ Fanvue-Send fehlgeschlagen (Auth?). Draft bleibt für Retry.");
+    }
 
   } else if (action === "discard") {
     await deleteDraft(draftId);
