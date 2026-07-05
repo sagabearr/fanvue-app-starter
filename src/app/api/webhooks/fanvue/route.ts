@@ -8,12 +8,14 @@ import { storeDraft } from "@/lib/drafts";
 const MAX_AGE_SECONDS = 300;
 const ENFORCE_TIMESTAMP = false;
 
-// ─── ENV check (logged once on cold start) ────────────────────────────────────
-const REQUIRED_ENV = ["ANTHROPIC_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"] as const;
-for (const key of REQUIRED_ENV) {
-  if (!process.env[key]) {
-    console.error(`[webhook/fanvue] FEHLER: Umgebungsvariable ${key} fehlt — Handler wird deaktiviert`);
-  }
+// ─── ENV check on cold start ─────────────────────────────────────────────────
+// ANTHROPIC_API_KEY + REDIS_URL → hard dependency (ohne diese: kein Reply möglich)
+// TELEGRAM_* → soft dependency (fehlt → escalate/block nur geloggt, safe läuft weiter)
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.error("[webhook/fanvue] FEHLER: ANTHROPIC_API_KEY fehlt — kein Reply möglich");
+}
+if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) {
+  console.warn("[webhook/fanvue] WARNUNG: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID fehlen — escalate/block nur geloggt");
 }
 
 // ─── Redis helpers ────────────────────────────────────────────────────────────
@@ -142,13 +144,20 @@ export async function POST(request: Request) {
   console.log(`[webhook/fanvue] senderUuid=${senderUuid ?? "n/a"} recipientUuid=${recipientUuid ?? "n/a"}`);
 
   if (recipientUuid === MILENA_UUID && senderUuid && senderUuid !== MILENA_UUID) {
-    const apiKey       = process.env.ANTHROPIC_API_KEY;
-    const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
-    const telegramChatId = process.env.TELEGRAM_CHAT_ID;
+    const apiKey = process.env.ANTHROPIC_API_KEY;
 
-    if (!apiKey || !telegramToken || !telegramChatId) {
-      console.error("[webhook/fanvue] fehlende ENV-Variablen (ANTHROPIC_API_KEY / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)");
+    // Anthropic ist hard dependency — ohne Claude kein Reply
+    if (!apiKey) {
+      console.error("[webhook/fanvue] ANTHROPIC_API_KEY fehlt — Abbruch");
       return NextResponse.json({ received: true }, { status: 200 });
+    }
+
+    const telegramToken  = process.env.TELEGRAM_BOT_TOKEN;
+    const telegramChatId = process.env.TELEGRAM_CHAT_ID;
+    const telegramOk     = !!(telegramToken && telegramChatId);
+
+    if (!telegramOk) {
+      console.warn("[webhook/fanvue] Telegram-ENV fehlt — escalate/block werden nur geloggt, safe läuft weiter");
     }
 
     const accessToken = await resolveAccessToken();
@@ -157,21 +166,30 @@ export async function POST(request: Request) {
       return NextResponse.json({ received: true }, { status: 200 });
     }
 
+    // Fallback für fehlendes Telegram: escalate/block nur ins Log
+    const telegramFn = telegramOk
+      ? (p: TelegramDraft) => sendTelegramDraft(p, telegramToken!, telegramChatId!)
+      : async (p: TelegramDraft) => {
+          console.warn(
+            `[webhook/fanvue] Telegram N/A — ${p.route} | fan=${p.fanUuid} | reason=${p.reason} | draft=${JSON.stringify(p.messages)}`,
+          );
+        };
+
     try {
       await handleFanMessage(senderUuid, {
-        loadPersona:    () => redisGet("milena:persona"),
-        loadCanon:      () => redisGet("milena:canon"),
-        loadFanMemory:  (uuid) => redisGet(`milena:fan:${uuid}`),
-        loadHistory:    (uuid) => loadFanvueHistory(accessToken, uuid),
-        sendToFanvue:   async (uuid, messages) => {
+        loadPersona:       () => redisGet("milena:persona"),
+        loadCanon:         () => redisGet("milena:canon"),
+        loadFanMemory:     (uuid) => redisGet(`milena:fan:${uuid}`),
+        loadHistory:       (uuid) => loadFanvueHistory(accessToken, uuid),
+        sendToFanvue:      async (uuid, messages) => {
           for (const text of messages) {
             const r = await sendFanvueMessage(accessToken, uuid, text);
             console.log(`[webhook/fanvue] gesendet an ${uuid}: Status=${r.status}`);
           }
         },
-        sendTelegramDraft: (p) => sendTelegramDraft(p, telegramToken, telegramChatId),
-        appendCanon:    (fact) => redisAppend("milena:canon", fact),
-        appendFanMemory: (uuid, note) => redisAppend(`milena:fan:${uuid}`, note),
+        sendTelegramDraft: telegramFn,
+        appendCanon:       (fact) => redisAppend("milena:canon", fact),
+        appendFanMemory:   (uuid, note) => redisAppend(`milena:fan:${uuid}`, note),
         apiKey,
       });
     } catch (e) {
