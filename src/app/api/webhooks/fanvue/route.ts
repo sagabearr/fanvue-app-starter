@@ -1,8 +1,9 @@
-import { createHmac, timingSafeEqual, randomUUID } from "crypto";
+import { createHmac, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { getRedis } from "@/lib/redisClient";
 import { resolveAccessToken, sendFanvueMessage, loadFanvueHistory, MILENA_UUID } from "@/lib/fanvueApi";
 import { handleFanMessage, TelegramDraft } from "@/lib/persona/handleFanMessage";
+import { storeDraft } from "@/lib/drafts";
 
 const MAX_AGE_SECONDS = 300;
 const ENFORCE_TIMESTAMP = false;
@@ -29,30 +30,6 @@ async function redisAppend(key: string, value: string): Promise<void> {
 }
 
 // ─── Telegram draft ───────────────────────────────────────────────────────────
-interface StoredDraft {
-  fanUuid: string;
-  messages: string[];
-}
-
-export async function storeDraft(fanUuid: string, messages: string[]): Promise<string> {
-  const r = await getRedis();
-  const id = randomUUID();
-  await r.setEx(`draft:${id}`, 172800, JSON.stringify({ fanUuid, messages } satisfies StoredDraft));
-  return id;
-}
-
-export async function loadDraft(id: string): Promise<StoredDraft | null> {
-  const r = await getRedis();
-  const raw = await r.get(`draft:${id}`);
-  if (!raw) return null;
-  try { return JSON.parse(raw) as StoredDraft; } catch { return null; }
-}
-
-export async function deleteDraft(id: string): Promise<void> {
-  const r = await getRedis();
-  await r.del(`draft:${id}`);
-}
-
 async function sendTelegramDraft(
   payload: TelegramDraft,
   botToken: string,

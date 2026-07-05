@@ -3,7 +3,7 @@
 //   https://api.telegram.org/bot{TOKEN}/setWebhook?url=https://DEINE_APP.vercel.app/api/webhooks/telegram
 
 import { NextResponse } from "next/server";
-import { loadDraft, deleteDraft } from "@/app/api/webhooks/fanvue/route";
+import { loadDraft, deleteDraft } from "@/lib/drafts";
 import { resolveAccessToken, sendFanvueMessage } from "@/lib/fanvueApi";
 
 async function answerCallback(token: string, callbackQueryId: string, text: string) {
